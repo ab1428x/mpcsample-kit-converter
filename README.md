@@ -10,6 +10,7 @@ Each kit is exported as a self-contained `.xpj` project alongside a `KitName_[Pr
 
 - Reads Akai `.xpm` kit definitions and maps every pad to its correct WAV
 - Preserves mute groups from the source XPM
+- Preserves multi-layer pads — velocity switching, stacking, and round-robin are all carried forward from the source XPM
 - Auto-detects BPM from kit filenames
 - Embeds the kit's demo groove when an `.sxq` sequence file is present alongside the `.xpm` — hit play and the pattern runs immediately at the correct BPM
 - Sets correct WAV start/end frame values so every sample plays immediately
@@ -156,6 +157,20 @@ Done: 28/28 kits.
 
 The `demo=Nhits` field means a `.sxq` demo groove was found for that kit and will be embedded in the sequence. Kits without one get a clean empty sequence.
 
+When a kit contains multi-layer pads the status line includes a `multi-layer=N` count showing how many pads have more than one layer:
+
+```
+  DRY  MPC TrapKit 1   [BPM=93  pads=16  demo=76hits  multi-layer=2]
+  DRY  MPC TrapKit 10  [BPM=76  pads=16  demo=84hits  multi-layer=5]
+```
+
+With `--no-multi-layer` the count is still shown so you can see what is being dropped:
+
+```
+  DRY  MPC TrapKit 1   [BPM=93  pads=16  demo=76hits  multi-layer=2 (layer 1 only)]
+  DRY  MPC TrapKit 10  [BPM=76  pads=16  demo=84hits  multi-layer=5 (layer 1 only)]
+```
+
 ---
 
 ### Step 4 — Convert
@@ -202,6 +217,25 @@ python3 mpc_kit_converter.py --expansion-name golddust --output ~/Desktop/kits -
 
 ---
 
+## Multi-layer pads
+
+Many expansion kits use multi-layer pads — pads with more than one sample assigned, triggered by velocity range, round-robin, or simultaneous stacking. The converter carries all of this forward by default, reading each layer's velocity range and play mode directly from the source XPM.
+
+MPC Sample supports multi-layer pads in full: velocity switching, stacking, and round-robin all work on-device. Note that on-device editing is limited to layer 1 only — additional layers play correctly but cannot be adjusted from the hardware UI.
+
+> **⚠ Warning — stacked layers and CPU load**
+>
+> Some expansion kits (notably Trap Drums and several producer kit packs) use **stacked layers** — multiple samples all assigned the same full velocity range (0–127) on a single pad, intended to play simultaneously on every hit. While this is faithful to the original kit design, each layer adds a separate voice. A pad with 3 or 4 stacked layers can generate 3–4 simultaneous voices on a single hit, and in a dense sequence with multiple pads firing at once the cumulative voice load can exceed what MPC Sample can handle, causing audio dropout or stuttering.
+>
+> **If you experience performance issues, regenerate with `--no-multi-layer`** to fall back to layer 1 only on all pads. This is the same behaviour as the previous version of the converter and is guaranteed to be safe on-device.
+
+```bash
+# Safe fallback — layer 1 only on every pad
+python3 mpc_kit_converter.py --expansion-name trapdrums --output ~/Desktop/kits --no-multi-layer
+```
+
+---
+
 ## All Options
 
 ### Mode flags (pick one)
@@ -241,6 +275,7 @@ python3 mpc_kit_converter.py --expansion-name golddust --output ~/Desktop/kits -
 
 | Flag | Description |
 |------|-------------|
+| `--no-multi-layer` | Use only the first layer per pad. Disables velocity switching, stacking, and round-robin — every pad plays a single sample regardless of how the source XPM was configured. **Use this if you experience audio dropout or CPU overload on-device** (see [Multi-layer pads](#multi-layer-pads)) |
 | `--overwrite` | Replace existing `.xpj` files and WAVs in the output folder. Without this, already-converted kits are skipped |
 | `--dry-run` | Preview what would be generated without writing anything to disk |
 | `--no-copy-wavs` | Write `.xpj` files only — skip copying WAVs. Use this when the WAVs are already accessible on the device at their original Content directory paths |
@@ -272,12 +307,12 @@ kits/
 
 Akai expansion packs ship with `.xpm` files (XML) that define drum programs — which WAV file goes to which pad, mute group assignments, and layer configuration. This script:
 
-1. Parses each `.xpm` to extract the 128-slot instrument map and mute groups
+1. Parses each `.xpm` to extract the 128-slot instrument map, mute groups, and per-pad layer definitions (sample names, velocity ranges, volume, pan, tuning, and play mode)
 2. Reads each WAV file's header to get the exact frame count (so MPC knows where each sample ends)
 3. Looks for a companion `.sxq` demo sequence file next to the `.xpm`. If found, the groove is translated into the project's sequence — pad hits, velocities, and BPM are all preserved. Notes that reference pads outside the kit's range are skipped cleanly.
-4. Builds a `.xpj` project JSON using the device template as a structural base, injecting the pad assignments, sample data, and sequence
+4. Builds a `.xpj` project JSON using the device template as a structural base, injecting the pad assignments, all layer data, and sequence. Multi-layer pads write a full `layersv` array with correct velocity ranges and the XPM's original play mode (`zonePlayTime`). With `--no-multi-layer`, only the first layer of each pad is written.
 5. Gzip-compresses the result with the standard MPC `ACVS` header
-6. Copies the kit's WAVs into a `_[ProjectData]` hidden folder alongside the `.xpj`
+6. Copies all layers' WAVs (deduplicated) into a `_[ProjectData]` hidden folder alongside the `.xpj`
 
 ---
 

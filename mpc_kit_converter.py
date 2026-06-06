@@ -308,17 +308,20 @@ def _make_sample_entry(wav_file: str, bpm: float) -> dict:
     }
 
 
-def _make_layer(wav_file: str, num_frames: int = 0) -> dict:
+def _make_layer(wav_file: str, num_frames: int = 0,
+                vel_start: int = 0, vel_end: int = 127,
+                volume: float = 1.0, pan: float = 0.5,
+                coarse_tune: int = 0, fine_tune: int = 0) -> dict:
     stem = os.path.splitext(wav_file)[0]
     return {
         "active":       True,
-        "volume":       {"gainCoefficient": 1.0, "controlValue": 1.0, "law": 1},
-        "pan":          0.5,
+        "volume":       {"gainCoefficient": volume, "controlValue": volume, "law": 1},
+        "pan":          pan,
         "pitch":        0.0,
-        "coarseTune":   0,
-        "fineTune":     0,
-        "velocityStart": 0,
-        "velocityEnd":  127,
+        "coarseTune":   coarse_tune,
+        "fineTune":     fine_tune,
+        "velocityStart": vel_start,
+        "velocityEnd":  vel_end,
         "sampleStart":  0,
         "sampleEnd":    num_frames,
         "loop":         False,
@@ -356,7 +359,9 @@ def build_xpj_bytes(kit_name: str, bpm: float, bars: int,
                     sxq_data: dict | None = None) -> bytes:
     """
     assignments: 128-element list; each slot is either None (empty pad) or
-                 {"dest_name": "file.wav", "mute_group": 0, "num_frames": N}
+                 {"layers": [{"dest_name": "f.wav", "num_frames": N,
+                  "vel_start": 0, "vel_end": 127, ...}, ...],
+                  "mute_group": 0, "zone_play": 1}
     sxq_data: optional parsed SXQ dict from parse_sxq(); populates the sequence
               with the kit's demo pattern. When None, an empty sequence is used.
     """
@@ -368,10 +373,12 @@ def build_xpj_bytes(kit_name: str, bpm: float, bars: int,
     old_name    = tmpl_track["name"]
     pulses      = 3840 * bars
 
-    samples = [
-        _make_sample_entry(a["dest_name"], bpm)
-        for a in assignments if a is not None
-    ]
+    seen_wavs = {}
+    for a in assignments:
+        if a is not None:
+            for layer in a["layers"]:
+                seen_wavs.setdefault(layer["dest_name"], True)
+    samples = [_make_sample_entry(wav, bpm) for wav in seen_wavs]
 
     instruments = []
     for slot in assignments:
@@ -379,7 +386,16 @@ def build_xpj_bytes(kit_name: str, bpm: float, bars: int,
             instruments.append({
                 **tmpl_active,
                 "whichMuteGroup": slot["mute_group"],
-                "layersv":        [_make_layer(slot["dest_name"], slot.get("num_frames", 0))],
+                "zonePlayTime":   slot["zone_play"],
+                "layersv": [
+                    _make_layer(
+                        l["dest_name"], l["num_frames"],
+                        l["vel_start"], l["vel_end"],
+                        l["volume"], l["pan"],
+                        l["coarse_tune"], l["fine_tune"],
+                    )
+                    for l in slot["layers"]
+                ],
             })
         else:
             instruments.append(tmpl_empty)
@@ -519,18 +535,31 @@ def parse_xpm(xpm_path: str) -> dict:
 
         mg = int((inst.findtext("MuteGroup") or "0").strip() or "0")
         mute_groups[num - 1] = mg
+        zone_play = int((inst.findtext("ZonePlay") or "1").strip() or "1")
 
-        layers = [
-            (layer.findtext("SampleName") or "").strip()
-            for layer in inst.findall("Layers/Layer")
-        ]
-        layers = [s for s in layers if s]
+        layers = []
+        for layer in inst.findall("Layers/Layer"):
+            name = (layer.findtext("SampleName") or "").strip()
+            if not name:
+                continue
+            active = (layer.findtext("Active") or "True").strip().lower() != "false"
+            if not active:
+                continue
+            layers.append({
+                "name":        name,
+                "vel_start":   int((layer.findtext("VelStart") or "0").strip() or "0"),
+                "vel_end":     int((layer.findtext("VelEnd") or "127").strip() or "127"),
+                "volume":      float((layer.findtext("Volume") or "1.0").strip() or "1.0"),
+                "pan":         float((layer.findtext("Pan") or "0.5").strip() or "0.5"),
+                "coarse_tune": int((layer.findtext("TuneCoarse") or "0").strip() or "0"),
+                "fine_tune":   int((layer.findtext("TuneFine") or "0").strip() or "0"),
+            })
         if layers:
             instruments.append({
-                "index":   num - 1,
-                "pad":     pad_label(num),
-                "primary": layers[0],
-                "layers":  layers,
+                "index":     num - 1,
+                "pad":       pad_label(num),
+                "zone_play": zone_play,
+                "layers":    layers,
             })
 
     return {"instruments": instruments, "mute_groups": mute_groups}
@@ -608,7 +637,8 @@ def generate_from_xpm(xpm_path: str, expansion_dir: str, output_dir: str,
                       bpm_override: float | None, bars: int,
                       overwrite: bool, dry_run: bool, copy_wavs: bool,
                       template_path=None, quiet: bool = False,
-                      bpm_fallback: float = 120.0) -> bool:
+                      bpm_fallback: float = 120.0,
+                      multi_layer: bool = True) -> bool:
     kit_name = os.path.splitext(os.path.basename(xpm_path))[0]
     bpm      = bpm_override if bpm_override is not None else extract_bpm(kit_name, bpm_fallback)
 
@@ -632,18 +662,32 @@ def generate_from_xpm(xpm_path: str, expansion_dir: str, output_dir: str,
     assignments = [None] * 128
     missing = []
     for inst in instruments:
-        idx      = inst["index"]
-        wav_file = wav_index.get(inst["primary"].lower())
-        if wav_file:
-            src = os.path.join(expansion_dir, wav_file)
+        idx        = inst["index"]
+        layer_defs = inst["layers"] if multi_layer else inst["layers"][:1]
+        resolved   = []
+        for ld in layer_defs:
+            wav_file = wav_index.get(ld["name"].lower())
+            if wav_file:
+                src = os.path.join(expansion_dir, wav_file)
+                resolved.append({
+                    "dest_name":   wav_file,
+                    "src":         src,
+                    "num_frames":  _get_wav_frames(src),
+                    "vel_start":   ld["vel_start"],
+                    "vel_end":     ld["vel_end"],
+                    "volume":      ld["volume"],
+                    "pan":         ld["pan"],
+                    "coarse_tune": ld["coarse_tune"],
+                    "fine_tune":   ld["fine_tune"],
+                })
+            else:
+                missing.append(ld["name"])
+        if resolved:
             assignments[idx] = {
-                "dest_name":  wav_file,
-                "src":        src,
+                "layers":     resolved,
                 "mute_group": mute_groups[idx],
-                "num_frames": _get_wav_frames(src),
+                "zone_play":  inst["zone_play"],
             }
-        else:
-            missing.append(inst["primary"])
 
     # Look for a companion .sxq demo sequence alongside the .xpm file.
     sxq_path = os.path.splitext(xpm_path)[0] + ".sxq"
@@ -653,7 +697,7 @@ def generate_from_xpm(xpm_path: str, expansion_dir: str, output_dir: str,
 
     active = [a for a in assignments if a is not None]
     multi  = sum(1 for i in instruments if len(i["layers"]) > 1
-                 and wav_index.get(i["primary"].lower()))
+                 and wav_index.get(i["layers"][0]["name"].lower()))
 
     status = f"BPM={bpm:.0f}  pads={len(active)}"
     if sxq_data:
@@ -664,8 +708,10 @@ def generate_from_xpm(xpm_path: str, expansion_dir: str, output_dir: str,
         status += f"  demo={valid_hits}hits"
     if missing:
         status += f"  missing={len(missing)}"
-    if multi:
-        status += f"  multi-layer={multi} (layer 1 used)"
+    if multi and not multi_layer:
+        status += f"  multi-layer={multi} (layer 1 only)"
+    elif multi:
+        status += f"  multi-layer={multi}"
 
     lines = [f"  {'DRY' if dry_run else 'OK ':3s}  {kit_name}  [{status}]"]
     for m in missing:
@@ -678,11 +724,15 @@ def generate_from_xpm(xpm_path: str, expansion_dir: str, output_dir: str,
     os.makedirs(out_folder, exist_ok=True)
 
     if copy_wavs:
+        seen_copy = set()
         for a in assignments:
             if a is not None:
-                dest = os.path.join(out_folder, a["dest_name"])
-                if not os.path.exists(dest) or overwrite:
-                    shutil.copy2(a["src"], dest)
+                for layer in a["layers"]:
+                    if layer["dest_name"] not in seen_copy:
+                        seen_copy.add(layer["dest_name"])
+                        dest = os.path.join(out_folder, layer["dest_name"])
+                        if not os.path.exists(dest) or overwrite:
+                            shutil.copy2(layer["src"], dest)
 
     with open(out_xpj, "wb") as f:
         f.write(build_xpj_bytes(kit_name, bpm, bars, assignments, template_path, sxq_data))
@@ -695,7 +745,8 @@ def process_expansion(expansion_dir: str, output_dir: str,
                       overwrite: bool, dry_run: bool, copy_wavs: bool,
                       template_path=None, quiet: bool = False,
                       filter_pat: str | None = None, skip_pat: str | None = None,
-                      workers: int = 1, bpm_fallback: float = 120.0) -> tuple[int, int]:
+                      workers: int = 1, bpm_fallback: float = 120.0,
+                      multi_layer: bool = True) -> tuple[int, int]:
     xpms = sorted(f for f in os.listdir(expansion_dir) if f.lower().endswith(".xpm"))
     if not xpms:
         return 0, 0
@@ -724,7 +775,7 @@ def process_expansion(expansion_dir: str, output_dir: str,
             os.path.join(expansion_dir, xpm_file),
             expansion_dir, exp_output_dir,
             bpm_override, bars, overwrite, dry_run, copy_wavs,
-            template_path, quiet, bpm_fallback,
+            template_path, quiet, bpm_fallback, multi_layer,
         )
 
     if workers > 1:
@@ -819,6 +870,8 @@ def main():
                    help="Only convert kits whose name contains PATTERN (case-insensitive)")
     p.add_argument("--skip",         metavar="PATTERN",
                    help="Skip kits whose name contains PATTERN (case-insensitive)")
+    p.add_argument("--no-multi-layer", action="store_true",
+                   help="Use only the first layer per pad (disables velocity switching and stacking)")
     p.add_argument("--overwrite",    action="store_true",
                    help="Replace existing output files")
     p.add_argument("--dry-run",      action="store_true",
@@ -838,6 +891,7 @@ def main():
         print("[DRY RUN — nothing will be written]\n")
 
     copy_wavs     = not args.no_copy_wavs
+    multi_layer   = not args.no_multi_layer
     template_path = args.template
     content_dir   = _get_content_dir(args.content_dir)
 
@@ -854,6 +908,7 @@ def main():
         skip_pat=args.skip,
         workers=args.workers,
         bpm_fallback=args.bpm_fallback,
+        multi_layer=multi_layer,
     )
 
     def require_output():
@@ -874,7 +929,7 @@ def main():
         generate_from_xpm(
             xpm, os.path.dirname(xpm), output_dir,
             args.bpm, args.bars, args.overwrite, args.dry_run,
-            copy_wavs, template_path, args.quiet, args.bpm_fallback,
+            copy_wavs, template_path, args.quiet, args.bpm_fallback, multi_layer,
         )
         return
 
